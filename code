@@ -1,0 +1,168 @@
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "esp_adc_cal.h"
+#include <WiFi.h>
+#include "time.h"
+
+// WiFi configurations
+const char* ssid = "Health Monitor";
+const char* password = "PASS_WORD";
+
+// Web server instance
+WiFiServer server(80);
+String header; // HTTP request header
+
+// OLED configurations
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MAX30100 configurations
+PulseOximeter pox;
+#define REPORTING_PERIOD_MS 1000
+
+// Temperature sensor configurations
+#define LM35_SENSOR_PIN 33
+esp_adc_cal_characteristics_t adcCharacteristics;
+
+// Global variables for sensor data
+uint32_t lastReportTime = 0;
+float heartRate = 0.0;
+float spo2 = 0.0;
+float temperatureInCelsius = 0.0;
+
+// Callback for pulse oximeter events
+void onPulseOximeterEvent() {
+  Serial.println("Pulse detected");
+}
+
+// Function to read and calibrate ADC value
+uint32_t readAndCalibrateADC(int rawADCValue) {
+  return esp_adc_cal_raw_to_voltage(rawADCValue, &adcCharacteristics);
+}
+
+// Initialize hardware and services
+void setup() {
+  Serial.begin(115200);
+
+  // Set up WiFi Access Point
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+  server.begin();
+
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  // Initialize MAX30100
+  if (!pox.begin()) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("MAX30100 init failed!");
+    display.display();
+    while (1);
+  }
+  pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+  pox.setOnBeatDetectedCallback(onPulseOximeterEvent);
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("MAX30100 Ready!");
+  display.display();
+
+  // Initialize temperature sensor
+  pinMode(LM35_SENSOR_PIN, INPUT);
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adcCharacteristics);
+}
+
+// Main loop to process sensor data and handle HTTP requests
+void loop() {
+  pox.update();
+
+  // Periodic data reading
+  if (millis() - lastReportTime > REPORTING_PERIOD_MS) {
+    lastReportTime = millis();
+
+    // Read heart rate and SpO2
+    heartRate = pox.getHeartRate();
+    spo2 = pox.getSpO2();
+
+    // Read temperature from LM35
+    int rawADCValue = analogRead(LM35_SENSOR_PIN);
+    float voltageInMilliVolts = readAndCalibrateADC(rawADCValue);
+    temperatureInCelsius = voltageInMilliVolts / 10.0;
+
+    // Debug output
+    Serial.printf("Heart Rate: %.1f bpm | SpO2: %.1f %% | Temp: %.1f °C\n", heartRate, spo2, temperatureInCelsius);
+
+    // Update OLED display
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Health Monitor");
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    display.setCursor(0, 20);
+    display.printf("Heart Rate: %.1f bpm\n", heartRate);
+    display.setCursor(0, 35);
+    display.printf("SpO2: %.1f %%\n", spo2);
+    display.setCursor(0, 50);
+    display.printf("Temp: %.1f C\n", temperatureInCelsius);
+    display.display();
+  }
+
+  // Handle HTTP client requests
+  WiFiClient client = server.available();
+  if (client) {
+    Serial.println("New Client.");
+    String currentLine = "";
+    while (client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        header += c;
+        if (c == '\n') {
+          if (currentLine.length() == 0) {
+            // Send HTTP response
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html");
+            client.println("Connection: close");
+            client.println();
+            client.println("<!DOCTYPE html><html>");
+            client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+            client.println("<style>html { font-family: Helvetica; text-align: center; } </style></head>");
+            client.println("<body><h1> Health Monitor</h1>");
+            client.printf("<p>Heart Rate: %.1f bpm</p>", heartRate);
+            client.printf("<p>SpO2: %.1f %%</p>", spo2);
+            client.printf("<p>Temperature: %.1f °C</p>", temperatureInCelsius);
+            client.println("</body></html>");
+            client.println();
+            break;
+            if(heartRate>100)
+            client.println("Heart rate too high try to take deep breaths and seek medical help");
+            else if(heartRate<40)
+            client.println("Heart Rate too low seek medical help immeadiately");
+            if(temperatureInCelsius>45)
+            client.println("Warning temperature beyond limits");
+          } else {
+            currentLine = "";
+          }
+        } else if (c != '\r') {
+          currentLine += c;
+        }
+      }
+    }
+    header = "";
+    client.stop();
+    Serial.println("Client disconnected.");
+  }
+}
